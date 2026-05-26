@@ -53,10 +53,22 @@ EXCHANGE_DATA = {("USD", "CNY"): 7.21, ("EUR", "CNY"): 7.85, ("GBP", "CNY"): 9.1
 TRANSLATE_DATA = {("你好世界", "english"): "Hello World", ("Good morning", "chinese"): "早上好", ("今天天气真好", "english"): "The weather is nice today", ("I love programming", "chinese"): "我喜欢编程", ("机器学习很有趣", "english"): "Machine learning is interesting", ("Happy birthday", "chinese"): "生日快乐"}
 UNIT_DATA = {"km_miles": 0.621371, "miles_km": 1.60934, "kg_pounds": 2.20462, "pounds_kg": 0.453592, "meters_feet": 3.28084, "feet_meters": 0.3048, "celsius_fahrenheit": 1.8, "fahrenheit_celsius": 0.5556}
 
+def convert_unit(args):
+    value = float(args.get("value", 0))
+    from_unit = args.get("from_unit", "").lower()
+    to_unit = args.get("to_unit", "").lower()
+    if from_unit == "celsius" and to_unit == "fahrenheit":
+        result = value * 1.8 + 32
+    elif from_unit == "fahrenheit" and to_unit == "celsius":
+        result = (value - 32) / 1.8
+    else:
+        result = value * UNIT_DATA.get(f"{from_unit}_{to_unit}", 1)
+    return {"result": round(result, 4)}
+
 # ======== 模拟执行 ========
 MOCK_RESULTS = {
     "calculate_math": lambda args: {"result": str(eval(str(args.get("expression", "0")).replace("^", "**").replace("×", "*").replace("÷", "/").replace("−", "-").replace("（", "(").replace("）", ")"), {"__builtins__": {}, "math": math}))},
-    "unit_converter": lambda args: {"result": round(float(args.get("value", 0)) * UNIT_DATA.get(f"{args.get('from_unit', '').lower()}_{args.get('to_unit', '').lower()}", 1), 4)},
+    "unit_converter": convert_unit,
     "get_current_weather": lambda args: (lambda w: {"city": args.get("location"), "temperature": w[0], "humidity": "65%", "condition": w[1]})(WEATHER_DATA.get(args.get("location"), ("22°C", "晴"))),
     "get_current_time": lambda args: {"datetime": TIME_DATA.get(args.get("timezone", "Asia/Shanghai"), "2025-03-07 14:30:00"), "timezone": args.get("timezone", "Asia/Shanghai")},
     "get_exchange_rate": lambda args: {"from": args.get("from_currency"), "to": args.get("to_currency"), "rate": EXCHANGE_DATA.get((args.get("from_currency"), args.get("to_currency")), 1.0)},
@@ -85,13 +97,15 @@ def execute_tool(name, args):
     fn = MOCK_RESULTS.get(name)
     if not fn: return None
     try:
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
-        signal.alarm(1)
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+            signal.alarm(1)
         return fn(args)
     except:
         return None
     finally:
-        try: signal.alarm(0)
+        try:
+            if hasattr(signal, "alarm"): signal.alarm(0)
         except: pass
 
 # ======== 多轮 Rollout ========
@@ -185,57 +199,65 @@ def validate_gt_in_text(text, gt_list):
     nums = [float(x) for x in re.findall(r'(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])', text_num)]
     return {g for g in gt_list if ((s := str(g).strip()) and s.lower() in text.lower()) or (re.fullmatch(r'[-+]?\d+(?:\.\d+)?', str(g).strip().replace(',', '')) and any(abs(float(str(g).strip().replace(',', '')) - n) < 1e-6 for n in nums))}
 
-def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
+def messages_from_prompt(prompt):
+    pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
+    matches = re.findall(pattern, prompt, re.DOTALL)
+    return [{"role": role, "content": content.strip()} for role, content in matches]
+
+
+def rule_reward(response, gt, tools, turn_outputs, unfinished):
+    reward = 0.0
+    turn_answers = [turn.split('</think>', 1)[-1].strip() if '</think>' in turn else turn.strip() for turn in turn_outputs]
+    answer = turn_answers[-1] if turn_answers else response.strip()
+    valid_names = {t['function']['name'] for t in tools} if tools else set()
+    tool_calls = []
+    for turn_answer in turn_answers: tool_calls.extend(parse_tool_calls(turn_answer))
+    reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)
+
+    if not tool_calls:
+        reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5
+        if '</think>' in response:
+            think, answer = response.split('</think>', 1)
+            reward += 1.0 if 20 <= len(think.strip()) <= 300 else -0.5
+            reward += 0.25 if response.count('</think>') == 1 else -0.25
+            answer = answer.strip()
+        reward -= rep_penalty(answer)
+        return max(min(reward, 3.0), -3.0)
+
+    valid_call_count = 0
+    for tool_call in tool_calls:
+        name, raw = tool_call.get("name", ""), tool_call.get("arguments", {})
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: raw = {}
+        check = CHECK_ARGS.get(name)
+        valid_call_count += int(bool(name in valid_names and check and check(raw)))
+
+    gt = gt or []
+    invalid_call_count = max(0, len(tool_calls) - valid_call_count)
+    reward += 0.5 if valid_call_count > 0 and invalid_call_count == 0 else -0.5 * max(1, invalid_call_count)
+    final_text = "" if unfinished else (answer.split('</tool_call>')[-1] if '</tool_call>' in answer else answer)
+    verified = validate_gt_in_text(final_text, gt) if gt else set()
+    if gt: reward += 2.5 * len(verified) / len(gt)
+    if unfinished: reward -= 0.5
+    reward -= rep_penalty(final_text if final_text else answer)
+    return max(min(reward, 3.0), -3.0)
+
+
+def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None, reward_mode="rule"):
     rewards = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
-        reward, answer = 0.0, response
+        reward = 0.0
         sample_idx = idx // num_gen
         tools = tools_batch[sample_idx]
         turn_outputs = turn_outputs_batch[idx] if turn_outputs_batch is not None else [response]
         unfinished = unfinished_batch[idx] if unfinished_batch is not None else False
-        turn_answers = [turn.split('</think>', 1)[-1].strip() if '</think>' in turn else turn.strip() for turn in turn_outputs]
-        answer = turn_answers[-1] if turn_answers else response.strip()
-        valid_names = {t['function']['name'] for t in tools} if tools else set()
-        tool_calls = []
-        for turn_answer in turn_answers: tool_calls.extend(parse_tool_calls(turn_answer))  # 解析tool调用
-        reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)  # 标签扣分
-        # -------- 无工具调用：格式+reward奖励 --------
-        if not tool_calls:
-            reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5  # 长度分
-            if '</think>' in response:
-                think, answer = response.split('</think>', 1)
-                reward += 1.0 if 20 <= len(think.strip()) <= 300 else -0.5  # 思考长度分
-                reward += 0.25 if response.count('</think>') == 1 else -0.25  # 思考闭合分
-                answer = answer.strip()
-            if reward_model is not None:
-                prompt = prompts[sample_idx]
-                pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
-                matches = re.findall(pattern, prompt, re.DOTALL)
-                messages = [{"role": role, "content": content.strip()} for role, content in matches]
-                score = reward_model.get_score(messages, answer)
-                reward += score  # RM分
-            reward -= rep_penalty(answer)
-            rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
-        # -------- 有工具调用：执行结果奖励 --------
-        else:
-            gt = gt_batch[sample_idx]
-            valid_call_count = 0
-            for tool_call in tool_calls:
-                name, raw = tool_call.get("name", ""), tool_call.get("arguments", {})
-                if isinstance(raw, str):
-                    try: raw = json.loads(raw)
-                    except: raw = {}
-                check = CHECK_ARGS.get(name)
-                valid_call_count += int(bool(name in valid_names and check and check(raw)))
-            tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)  # tool数差值
-            reward += 0.5 if tool_gap == 0 else -0.5 * tool_gap  # tool对齐分
-            
-            final_text = "" if unfinished else (answer.split('</tool_call>')[-1] if '</tool_call>' in answer else answer)
-            verified = validate_gt_in_text(final_text, gt) if gt else set()
-            if gt: reward += 2.5 * len(verified) / len(gt)  # GT分
-            if unfinished: reward -= 0.5  # 未完成扣分
-            reward -= rep_penalty(final_text if final_text else answer)
-            rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
+        if reward_mode in ("rule", "hybrid"):
+            reward += rule_reward(response, gt_batch[sample_idx], tools, turn_outputs, unfinished)
+        if reward_mode in ("rm", "hybrid") and reward_model is not None:
+            answer = turn_outputs[-1].split('</think>', 1)[-1].strip() if turn_outputs else response.strip()
+            reward += reward_model.get_score(messages_from_prompt(prompts[sample_idx]), answer)
+        rewards[idx] = max(min(reward, 3.0), -3.0)
     return rewards
 
 # ================================ 工具与 Reward = End ================================
@@ -270,7 +292,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         old_per_token_logps = torch.tensor([old_logps + [0.0] * ((max_len - 1) - len(old_logps)) for _, _, _, old_logps in packed_samples], device=args.device, dtype=torch.float32)
         full_mask = (input_ids != tokenizer.pad_token_id).long()
 
-        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
+        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch, reward_mode=args.reward_mode)
 
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
@@ -405,6 +427,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug_mode", action="store_true", help="调试模式")
     parser.add_argument("--debug_interval", type=int, default=20, help="调试日志间隔")
     parser.add_argument("--thinking_ratio", type=float, default=0.1, help="按概率开启thinking（0.0~1.0）")
+    parser.add_argument("--reward_mode", type=str, default="rule", choices=["rule", "rm", "hybrid"], help="reward来源：rule=规则奖励，rm=外部Reward模型，hybrid=二者相加")
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
     parser.add_argument("--rollout_engine", type=str, default="torch", choices=["torch", "sglang"], help="rollout引擎类型")
     parser.add_argument("--sglang_base_url", type=str, default="http://localhost:8998", help="SGLang服务器URL")
@@ -437,8 +460,13 @@ if __name__ == "__main__":
     ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
 
-    reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
-    Logger(f'Loaded reward model from {args.reward_model_path}')
+    reward_model = None
+    if args.reward_mode in ("rm", "hybrid") and args.reward_model_path.lower() != "none":
+        reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
+        Logger(f'Loaded reward model from {args.reward_model_path}')
+    elif args.reward_mode in ("rm", "hybrid"):
+        Logger('Reward model disabled because --reward_model_path none was set; falling back to rule mode.')
+        args.reward_mode = "rule"
     # Rollout引擎
     rollout_engine = create_rollout_engine(
         engine_type=args.rollout_engine,
