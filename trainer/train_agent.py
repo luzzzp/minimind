@@ -63,7 +63,7 @@ def convert_unit(args):
         result = (value - 32) / 1.8
     else:
         result = value * UNIT_DATA.get(f"{from_unit}_{to_unit}", 1)
-    return {"result": round(result, 4)}
+    return {"result": round(result, 4), "from": f"{value:g} {from_unit}", "to": to_unit}
 
 # ======== 模拟执行 ========
 MOCK_RESULTS = {
@@ -92,6 +92,30 @@ def parse_tool_calls(text):
         try: calls.append(json.loads(m.strip()))
         except: pass
     return calls
+
+def normalize_tool_args(args):
+    if isinstance(args, str):
+        try: return json.loads(args)
+        except: return {}
+    return args if isinstance(args, dict) else {}
+
+def args_match(pred, expected):
+    pred, expected = normalize_tool_args(pred), normalize_tool_args(expected)
+    if not expected:
+        return True
+    ok = 0
+    for key, value in expected.items():
+        if key not in pred:
+            continue
+        if isinstance(value, (int, float)):
+            try: ok += abs(float(pred[key]) - float(value)) < 1e-6
+            except: pass
+        else:
+            ok += str(pred[key]).lower() == str(value).lower()
+    return ok == len(expected)
+
+def has_bad_tool_format(text):
+    return text.count("<tool_call>") != text.count("</tool_call>") or bool(re.search(r"<tool_call>\s*</tool_call>", text, re.DOTALL))
 
 def execute_tool(name, args):
     fn = MOCK_RESULTS.get(name)
@@ -205,20 +229,27 @@ def messages_from_prompt(prompt):
     return [{"role": role, "content": content.strip()} for role, content in matches]
 
 
-def rule_reward(response, gt, tools, turn_outputs, unfinished):
+def rule_reward(response, expected_answer_values, tools, turn_outputs, unfinished, expected_tools=None, expected_arguments=None):
     reward = 0.0
     turn_answers = [turn.split('</think>', 1)[-1].strip() if '</think>' in turn else turn.strip() for turn in turn_outputs]
     answer = turn_answers[-1] if turn_answers else response.strip()
     valid_names = {t['function']['name'] for t in tools} if tools else set()
     tool_calls = []
     for turn_answer in turn_answers: tool_calls.extend(parse_tool_calls(turn_answer))
-    reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)
+    expected_tools = expected_tools or []
+    expected_arguments = expected_arguments or []
+    expected_answer_values = expected_answer_values or []
+    format_errors = sum(int(has_bad_tool_format(turn)) for turn in turn_answers)
+    reward -= 1.0 * format_errors
+    reward -= 0.75 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)
 
     if not tool_calls:
-        reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5
+        reward += 0.25 if 5 <= len(response.strip()) <= 800 else -0.5
+        if expected_tools:
+            reward -= 1.0
         if '</think>' in response:
             think, answer = response.split('</think>', 1)
-            reward += 1.0 if 20 <= len(think.strip()) <= 300 else -0.5
+            reward += 0.25 if 20 <= len(think.strip()) <= 300 else -0.25
             reward += 0.25 if response.count('</think>') == 1 else -0.25
             answer = answer.strip()
         reward -= rep_penalty(answer)
@@ -233,18 +264,29 @@ def rule_reward(response, gt, tools, turn_outputs, unfinished):
         check = CHECK_ARGS.get(name)
         valid_call_count += int(bool(name in valid_names and check and check(raw)))
 
-    gt = gt or []
     invalid_call_count = max(0, len(tool_calls) - valid_call_count)
-    reward += 0.5 if valid_call_count > 0 and invalid_call_count == 0 else -0.5 * max(1, invalid_call_count)
+    pred_tools = [call.get("name", "") for call in tool_calls]
+    if expected_tools:
+        reward += 0.8 if pred_tools == expected_tools else -0.8
+        reward -= 0.4 * max(0, len(pred_tools) - len(expected_tools))
+    reward += 0.4 if valid_call_count > 0 and invalid_call_count == 0 else -0.6 * max(1, invalid_call_count)
+    if expected_arguments and len(tool_calls) >= len(expected_arguments):
+        matched_args = sum(args_match(call.get("arguments", {}), exp) for call, exp in zip(tool_calls, expected_arguments))
+        reward += 0.8 * matched_args / len(expected_arguments)
+        if matched_args < len(expected_arguments):
+            reward -= 0.6
+    elif expected_arguments:
+        reward -= 0.6
+
     final_text = "" if unfinished else (answer.split('</tool_call>')[-1] if '</tool_call>' in answer else answer)
-    verified = validate_gt_in_text(final_text, gt) if gt else set()
-    if gt: reward += 2.5 * len(verified) / len(gt)
-    if unfinished: reward -= 0.5
+    verified = validate_gt_in_text(final_text, expected_answer_values) if expected_answer_values else set()
+    if expected_answer_values: reward += 1.8 * len(verified) / len(expected_answer_values)
+    if unfinished: reward -= 1.0
     reward -= rep_penalty(final_text if final_text else answer)
     return max(min(reward, 3.0), -3.0)
 
 
-def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None, reward_mode="rule"):
+def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None, reward_mode="rule", expected_tools_batch=None, expected_arguments_batch=None, expected_answer_values_batch=None):
     rewards = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
         reward = 0.0
@@ -252,8 +294,11 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
         tools = tools_batch[sample_idx]
         turn_outputs = turn_outputs_batch[idx] if turn_outputs_batch is not None else [response]
         unfinished = unfinished_batch[idx] if unfinished_batch is not None else False
+        expected_answers = (expected_answer_values_batch or gt_batch)[sample_idx]
+        expected_tools = (expected_tools_batch or [[] for _ in gt_batch])[sample_idx]
+        expected_arguments = (expected_arguments_batch or [[] for _ in gt_batch])[sample_idx]
         if reward_mode in ("rule", "hybrid"):
-            reward += rule_reward(response, gt_batch[sample_idx], tools, turn_outputs, unfinished)
+            reward += rule_reward(response, expected_answers, tools, turn_outputs, unfinished, expected_tools, expected_arguments)
         if reward_mode in ("rm", "hybrid") and reward_model is not None:
             answer = turn_outputs[-1].split('</think>', 1)[-1].strip() if turn_outputs else response.strip()
             reward += reward_model.get_score(messages_from_prompt(prompts[sample_idx]), answer)
@@ -267,6 +312,9 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         messages_batch = batch['messages']
         tools_batch = batch['tools']
         gt_batch = batch['gt']
+        expected_tools_batch = batch.get('expected_tools', [[] for _ in gt_batch])
+        expected_arguments_batch = batch.get('expected_arguments', [[] for _ in gt_batch])
+        expected_answer_values_batch = batch.get('expected_answer_values', gt_batch)
         last_step = step
 
         with torch.no_grad():
@@ -292,7 +340,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         old_per_token_logps = torch.tensor([old_logps + [0.0] * ((max_len - 1) - len(old_logps)) for _, _, _, old_logps in packed_samples], device=args.device, dtype=torch.float32)
         full_mask = (input_ids != tokenizer.pad_token_id).long()
 
-        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch, reward_mode=args.reward_mode)
+        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch, reward_mode=args.reward_mode, expected_tools_batch=expected_tools_batch, expected_arguments_batch=expected_arguments_batch, expected_answer_values_batch=expected_answer_values_batch)
 
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
@@ -481,7 +529,14 @@ if __name__ == "__main__":
     train_ds = AgentRLDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    def collate_fn(batch): return {'messages': [b['messages'] for b in batch], 'tools': [b['tools'] for b in batch], 'gt': [b['gt'] for b in batch]}
+    def collate_fn(batch): return {
+        'messages': [b['messages'] for b in batch],
+        'tools': [b['tools'] for b in batch],
+        'gt': [b['gt'] for b in batch],
+        'expected_tools': [b.get('expected_tools', []) for b in batch],
+        'expected_arguments': [b.get('expected_arguments', []) for b in batch],
+        'expected_answer_values': [b.get('expected_answer_values', b.get('gt', [])) for b in batch],
+    }
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, collate_fn=collate_fn)
     iters = len(loader_for_count)
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs

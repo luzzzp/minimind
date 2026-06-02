@@ -132,18 +132,31 @@ class DPODataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def create_chat_prompt(self, conversations):
+        messages = []
+        tools = None
+        for message in conversations:
+            message = dict(message)
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            messages.append(message)
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=tools
+        )
+
     def __getitem__(self, index):
         sample = self.samples[index]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = sample['rejected']  # 同上
-        chosen_prompt = self.tokenizer.apply_chat_template(
-            chosen, tokenize=False, add_generation_prompt=False
-        )
+        chosen_prompt = self.create_chat_prompt(chosen)
         chosen_prompt = post_processing_chat(chosen_prompt)
 
-        rejected_prompt = self.tokenizer.apply_chat_template(
-            rejected, tokenize=False, add_generation_prompt=False
-        )
+        rejected_prompt = self.create_chat_prompt(rejected)
         rejected_prompt = post_processing_chat(rejected_prompt)
         chosen_encoding = self.tokenizer(
             chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
@@ -249,7 +262,14 @@ class AgentRLDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         messages, tools = self.parse_conversations(sample['conversations'])
-        return {'messages': messages, 'tools': tools, 'gt': sample['gt']}
+        return {
+            'messages': messages,
+            'tools': tools,
+            'gt': sample.get('gt', sample.get('expected_answer_values', [])),
+            'expected_tools': sample.get('expected_tools', []),
+            'expected_arguments': sample.get('expected_arguments', []),
+            'expected_answer_values': sample.get('expected_answer_values', sample.get('gt', [])),
+        }
 
 
 if __name__ == "__main__":

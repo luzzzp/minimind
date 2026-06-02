@@ -126,6 +126,22 @@ def final_answer(name, arguments, result):
     raise ValueError(f"unknown tool: {name}")
 
 
+def answer_values_for(name, arguments, result):
+    if name == "calculate_math":
+        return [result["result"]]
+    if name == "unit_converter":
+        return [str(result["result"]), arguments["to_unit"]]
+    if name == "get_current_weather":
+        return [result["city"], result["temperature"], result["condition"]]
+    if name == "get_current_time":
+        return [result["timezone"], result["datetime"]]
+    if name == "get_exchange_rate":
+        return [result["from"], result["to"], str(result["rate"])]
+    if name == "translate_text":
+        return [result["translated_text"]]
+    raise ValueError(f"unknown tool: {name}")
+
+
 def sample_task(rng):
     builders = [
         build_math_task,
@@ -192,21 +208,27 @@ def build_two_step_task(rng):
         "calls": [tool_call("get_current_weather", args1), tool_call("unit_converter", args2)],
         "results": [res1, res2],
         "answer": f"{city}当前天气为{res1['condition']}，温度{res1['temperature']}；{value} km 约等于 {res2['result']} miles。",
-        "gt": [res1["temperature"], res1["condition"], str(res2["result"])],
+        "expected_tools": ["get_current_weather", "unit_converter"],
+        "expected_arguments": [args1, args2],
+        "expected_answer_values": [city, res1["temperature"], res1["condition"], str(res2["result"]), "miles"],
+        "gt": [city, res1["temperature"], res1["condition"], str(res2["result"]), "miles"],
     }
 
 
 def make_single(name, arguments, prompt, available):
     result = result_for(name, arguments)
     answer = final_answer(name, arguments, result)
-    gt = [str(v) for v in result.values() if isinstance(v, (str, int, float))]
+    expected_answer_values = answer_values_for(name, arguments, result)
     return {
         "prompt": prompt,
         "tools": tool_schema(available),
         "calls": [tool_call(name, arguments)],
         "results": [result],
         "answer": answer,
-        "gt": gt,
+        "expected_tools": [name],
+        "expected_arguments": [arguments],
+        "expected_answer_values": expected_answer_values,
+        "gt": expected_answer_values,
     }
 
 
@@ -214,27 +236,51 @@ def sft_row(task):
     conversations = [{"role": "system", "content": "你是一个会严格按工具规范解决问题的AI助手。", "tools": json.dumps(task["tools"], ensure_ascii=False)}]
     conversations.append({"role": "user", "content": task["prompt"]})
     for call, result in zip(task["calls"], task["results"]):
-        conversations.append({"role": "assistant", "content": tool_call_text(call["name"], call["arguments"])})
+        conversations.append({"role": "assistant", "content": "", "tool_calls": json.dumps([call], ensure_ascii=False)})
         conversations.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
     conversations.append({"role": "assistant", "content": task["answer"]})
+    return {"conversations": conversations}
+
+
+def repair_row(task):
+    bad_call = json.dumps(task["calls"][0], ensure_ascii=False)
+    conversations = [{"role": "system", "content": "你是一个会严格按工具规范修复工具调用格式的AI助手。", "tools": json.dumps(task["tools"], ensure_ascii=False)}]
+    conversations.append({
+        "role": "user",
+        "content": f"下面的工具调用格式不规范，请只输出修复后的标准工具调用：\n{bad_call}",
+    })
+    conversations.append({"role": "assistant", "content": "", "tool_calls": json.dumps([task["calls"][0]], ensure_ascii=False)})
     return {"conversations": conversations}
 
 
 def dpo_row(task, rng):
     chosen = sft_row(task)["conversations"]
     rejected = deepcopy(chosen)
-    mode = rng.choice(["wrong_tool", "wrong_args", "direct_answer", "bad_format"])
+    mode = rng.choice(["wrong_tool", "missing_args", "near_wrong_args", "direct_answer", "bad_format", "wrong_final"])
     if mode == "direct_answer":
         rejected = rejected[:2] + [{"role": "assistant", "content": "我认为答案大概是 42。"}]
     elif mode == "bad_format":
         rejected[2]["content"] = json.dumps(task["calls"][0], ensure_ascii=False)
+        rejected[2].pop("tool_calls", None)
     elif mode == "wrong_tool":
         wrong = "get_current_time" if task["calls"][0]["name"] != "get_current_time" else "get_current_weather"
-        rejected[2]["content"] = tool_call_text(wrong, {})
+        rejected[2] = {"role": "assistant", "content": "", "tool_calls": json.dumps([tool_call(wrong, {})], ensure_ascii=False)}
+    elif mode == "wrong_final":
+        rejected[-1]["content"] = "工具结果显示任务已经完成，但最终答案是 42。"
+    elif mode == "missing_args":
+        bad_call = deepcopy(task["calls"][0])
+        bad_call["arguments"] = {}
+        rejected[2] = {"role": "assistant", "content": "", "tool_calls": json.dumps([bad_call], ensure_ascii=False)}
     else:
         bad_call = deepcopy(task["calls"][0])
-        bad_call["arguments"] = {"value": -1}
-        rejected[2]["content"] = tool_call_text(bad_call["name"], bad_call["arguments"])
+        bad_args = deepcopy(bad_call["arguments"])
+        for key, value in list(bad_args.items())[:1]:
+            if isinstance(value, (int, float)):
+                bad_args[key] = value + 1
+            elif isinstance(value, str):
+                bad_args[key] = value + "_wrong"
+        bad_call["arguments"] = bad_args
+        rejected[2] = {"role": "assistant", "content": "", "tool_calls": json.dumps([bad_call], ensure_ascii=False)}
     return {"chosen": chosen, "rejected": rejected}
 
 
@@ -245,7 +291,10 @@ def agent_row(task):
             {"role": "user", "content": task["prompt"]},
             {"role": "assistant", "content": ""},
         ],
-        "gt": task["gt"],
+        "expected_tools": task["expected_tools"],
+        "expected_arguments": task["expected_arguments"],
+        "expected_answer_values": task["expected_answer_values"],
+        "gt": task["expected_answer_values"],
     }
 
 
@@ -253,9 +302,10 @@ def eval_row(task):
     return {
         "prompt": task["prompt"],
         "tools": task["tools"],
-        "expected_tools": [call["name"] for call in task["calls"]],
-        "expected_arguments": [call["arguments"] for call in task["calls"]],
-        "gt": task["gt"],
+        "expected_tools": task["expected_tools"],
+        "expected_arguments": task["expected_arguments"],
+        "expected_answer_values": task["expected_answer_values"],
+        "gt": task["expected_answer_values"],
         "answer": task["answer"],
     }
 
@@ -263,6 +313,17 @@ def eval_row(task):
 def build_rows(size, seed):
     rng = random.Random(seed)
     return [sample_task(rng) for _ in range(size)]
+
+
+def build_sft_rows(size, seed, repair_ratio):
+    rng = random.Random(seed)
+    rows = []
+    repair_size = int(size * repair_ratio)
+    normal_size = size - repair_size
+    rows.extend(sft_row(t) for t in build_rows(normal_size, seed))
+    rows.extend(repair_row(t) for t in build_rows(repair_size, seed + 10086))
+    rng.shuffle(rows)
+    return rows
 
 
 def main():
@@ -273,9 +334,10 @@ def main():
     parser.add_argument("--dpo_size", default=2000, type=int)
     parser.add_argument("--rl_size", default=1000, type=int)
     parser.add_argument("--eval_size", default=200, type=int)
+    parser.add_argument("--repair_ratio", default=0.15, type=float, help="SFT格式修复样本比例")
     args = parser.parse_args()
 
-    dump_jsonl(os.path.join(args.output_dir, "intern_tool_sft.jsonl"), [sft_row(t) for t in build_rows(args.sft_size, args.seed)])
+    dump_jsonl(os.path.join(args.output_dir, "intern_tool_sft.jsonl"), build_sft_rows(args.sft_size, args.seed, args.repair_ratio))
     rng = random.Random(args.seed + 1)
     dump_jsonl(os.path.join(args.output_dir, "intern_tool_dpo.jsonl"), [dpo_row(t, rng) for t in build_rows(args.dpo_size, args.seed + 2)])
     dump_jsonl(os.path.join(args.output_dir, "intern_tool_agent.jsonl"), [agent_row(t) for t in build_rows(args.rl_size, args.seed + 3)])
